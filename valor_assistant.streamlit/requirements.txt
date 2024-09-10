@@ -1,2 +1,4 @@
 ollama==0.1.8
 streamlit==1.33.0
+gcsfs==2024.6.1
+st-files-connection
