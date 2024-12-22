@@ -1,6 +1,6 @@
 import streamlit as st
 import os
-import io
+from io import BytesIO
 from google.cloud import storage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.api_core.exceptions import GoogleAPIError
@@ -8,9 +8,22 @@ from llama_cpp import Llama
 import pandas as pd
 from typing import Dict, List
 import json
-
+from langchain_community.document_loaders import UnstructuredFileLoader
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_text_splitters import CharacterTextSplitter
+import tempfile
+from PyPDF2 import PdfReader
+import textwrap
+import re
+import traceback
+from typing import Dict
+import time
 # Page configuration
-st.set_page_config(page_title="Valor Assistant", page_icon="📁", layout="wide")
+st.set_page_config(page_title="Valor Assistant", 
+                   page_icon="📁", 
+                   layout="wide",
+                   initial_sidebar_state="expanded"
+                   )
 
 # Constants
 ALLOWED_EXTENSIONS = {'.pdf'}
@@ -147,6 +160,40 @@ def delete_blob(bucket_name, blob_name):
         st.error(f"Error deleting {blob_name}: {str(e)}")
         return False
 
+def parse_and_store_pdf(file_content: bytes, filename: str, bucket_name: str) -> bool:
+    """
+    Parse PDF content and store both raw PDF and parsed text in GCS.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        storage_client = get_storage_client()
+        bucket = storage_client.bucket(bucket_name)
+        
+        # Store original PDF
+        pdf_blob = bucket.blob(f"pdfs/{filename}")
+        pdf_blob.upload_from_string(file_content)
+        
+        # Parse PDF content
+        pdf_file = BytesIO(file_content)
+        pdf_reader = PdfReader(pdf_file)
+        
+        full_text = ""
+        for page in pdf_reader.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n\n"  # Add page breaks for clarity
+        
+        # Store parsed text
+        text_filename = f"parsed/{os.path.splitext(filename)[0]}.txt"
+        text_blob = bucket.blob(text_filename)
+        text_blob.upload_from_string(full_text)
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"Error processing {filename}: {str(e)}")
+        return False
+
 # Initialize session state
 if 'current_page' not in st.session_state:
     st.session_state.current_page = 'home'
@@ -174,65 +221,51 @@ if st.session_state.current_page == 'home':
     st.header("Welcome to Valor Assistant")
     st.write("Use the navigation buttons above to upload files or explore the file system.")
 
-elif st.session_state.current_page == 'upload':
-    st.header("File Upload")
+if st.session_state.current_page == 'upload':
     if not st.session_state.upload_complete:
         uploaded_files = st.file_uploader("Upload PDF", type=list(ALLOWED_EXTENSIONS), accept_multiple_files=True)
 
         if uploaded_files:
             new_files = [file for file in uploaded_files if file not in st.session_state.uploaded_files]
             valid_files = [file for file in new_files if is_valid_file(file.name)]
-            invalid_files = [file for file in new_files if file not in valid_files]
-            
-            st.session_state.uploaded_files.extend(valid_files)
             
             if valid_files:
+                st.session_state.uploaded_files.extend(valid_files)
                 st.write(f"{len(valid_files)} new valid files added.")
-            if invalid_files:
-                st.warning(f"{len(invalid_files)} files were not added due to invalid file type. Only PDF files are allowed.")
 
-        if st.session_state.uploaded_files:
-            st.write("Files ready for upload:")
-            for i, file in enumerate(st.session_state.uploaded_files, 1):
-                st.write(f"{i}. {file.name}")
-
-        if st.button("Submit"):
+        if st.session_state.uploaded_files and st.button("Submit"):
             bucket_name = get_bucket_name()
-            if not bucket_name:
-                st.error("Cannot proceed without a valid bucket name.")
-            else:
+            if bucket_name:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-
-                def upload_file(file):
-                    return file, upload_blob(bucket_name, file.name, file)
-
+                
                 successful_uploads = 0
                 failed_uploads = 0
-
-                with ThreadPoolExecutor() as executor:
-                    future_to_file = {executor.submit(upload_file, file): file for file in st.session_state.uploaded_files}
-                    for i, future in enumerate(as_completed(future_to_file)):
-                        file, result = future.result()
-                        if result and not result.startswith("Error"):
+                
+                for i, file in enumerate(st.session_state.uploaded_files):
+                    try:
+                        file_content = file.read()
+                        # Parse and store both PDF and text content
+                        if parse_and_store_pdf(file_content, file.name, bucket_name):
                             successful_uploads += 1
-                            st.session_state.upload_summary.append(result)
+                            st.session_state.upload_summary.append(f"Successfully processed: {file.name}")
                         else:
                             failed_uploads += 1
-                            st.session_state.upload_summary.append(f"Failed to upload {file.name}: {result}")
-                        
-                        progress = (i + 1) / len(future_to_file)
+                            st.session_state.upload_summary.append(f"Failed to process: {file.name}")
+                            
+                        progress = (i + 1) / len(st.session_state.uploaded_files)
                         progress_bar.progress(progress)
-                        status_text.text(f"Uploading... {i+1}/{len(future_to_file)}")
-
-                if failed_uploads > 0:
-                    st.warning(f"{successful_uploads} files uploaded successfully. {failed_uploads} files failed to upload.")
-                else:
-                    st.success(f"All {successful_uploads} files uploaded successfully!")
-
+                        status_text.text(f"Processing... {i+1}/{len(st.session_state.uploaded_files)}")
+                        
+                    except Exception as e:
+                        failed_uploads += 1
+                        st.session_state.upload_summary.append(f"Error processing {file.name}: {str(e)}")
+                
                 st.session_state.upload_complete = True
-                st.session_state.uploaded_files = []
-                st.rerun()
+                if failed_uploads > 0:
+                    st.warning(f"{successful_uploads} files processed successfully. {failed_uploads} files failed.")
+                else:
+                    st.success(f"All {successful_uploads} files processed successfully!")
 
     else:
         if any(summary.startswith("Failed") for summary in st.session_state.upload_summary):
@@ -354,153 +387,597 @@ elif st.session_state.current_page == 'explorer':
             st.write("No files found in the bucket or error occurred.")
     else:
         st.error("Unable to retrieve bucket name.")
-
 # Add Llama model initialization
 @st.cache_resource
+
 def initialize_llama():
     try:
-        # Update the path to your Llama model
-        model_path = "path/to/your/llama/model.gguf"
+        model_path = "/Users/tommyropp/Desktop/Valor_BD_Project/ValorAssistant/Meta-Llama-3-8B-Instruct.Q5_K_M.gguf"
+        
         llm = Llama(
             model_path=model_path,
-            n_ctx=2048,  # Context window
-            n_threads=4   # Number of CPU threads to use
+            n_ctx=3000,  # Reduced context window for faster processing
+            n_gpu_layers=-1,
+            n_threads=12,  # Increased threads
+            n_batch=512,
+            f16_kv=True,
+            verbose=False
         )
         return llm
     except Exception as e:
         st.error(f"Failed to initialize Llama model: {str(e)}")
         return None
 
-# Add business matching function
-def match_business_parameters(llm: Llama, parameters: Dict, one_pagers: List[Dict]) -> str:
-    # Create prompt
-    prompt = f"""You are a business matching expert. Analyze these business parameters and compare them with private equity one-pagers to find the best matches.
+def get_parsed_documents(bucket_name: str) -> List[str]:
+    """
+    Get list of all parsed document names from the 'parsed/' directory.
+    Returns a list of filenames.
+    """
+    try:
+        storage_client = get_storage_client()
+        bucket = storage_client.bucket(bucket_name)
+        # Only list blobs in the parsed/ directory
+        blobs = bucket.list_blobs(prefix="parsed/")
+        return [blob.name for blob in blobs if blob.name.endswith('.txt')]
+    except Exception as e:
+        st.error(f"Error listing parsed documents: {str(e)}")
+        return []
 
-Business Parameters:
-{json.dumps(parameters, indent=2)}
+def get_parsed_document(bucket_name: str, filename: str) -> str:
+    """
+    Retrieve pre-parsed document text content from storage.
+    Returns the actual text content of a single document.
+    """
+    try:
+        storage_client = get_storage_client()
+        bucket = storage_client.bucket(bucket_name)
+        text_filename = f"parsed/{os.path.splitext(filename)[0]}.txt"
+        blob = bucket.blob(text_filename)
+        return blob.download_as_text()
+    except Exception as e:
+        st.error(f"Error retrieving parsed text for {filename}: {str(e)}")
+        return None
 
-Available One-Pagers:
-{json.dumps(one_pagers, indent=2)}
+def analyze_document(llm: Llama, document_text: str, parameters: Dict) -> str:
+    """
+    Analyze document text with partial matching ranges for all criteria.
+    """
+    try:
+        prompt = f""" You are a deal screening analyst. You will be given data on investment criteria
+        that different private equity firms have. The user has input information on a company that is for sale.
+        Your job is to score how well the inputted information matches the criteria from the private equity
+        firms. Return ONLY valid JSON with the following format:
 
-Please provide the top 3 matches with explanations for why they are good fits. Consider factors like industry alignment, financial compatibility, and growth potential.
+{{
+"score": <total points from 0-100>,
+"matching_points": [
+    "FINANCE: [exact values] - [match type]",
+    "INDUSTRY: [specific description] - [match type]",
+    "GEO: [specific regions] - [match type]"
+],
+"concerns": [
+    "specific gaps or mismatches in provided criteria"
+],
+"summary": "brief analysis focusing on match quality"
+}}
+
+CRITERIA PROVIDED:
+• Enterprise Value Target: ${parameters['enterprise_value']}M
+• Revenue Target: ${parameters['revenue']}M
+• EBITDA Target: ${parameters['ebitda']}M
+• Industry Focus: {parameters['industry']}
+• Geographic Focus: {parameters['geography']}
+
+SCORING RULES (Total score must be between 0-100):
+Each criterion is worth up to 33.33 points:
+
+Financial Metrics (Combined worth 33.33 points):
+• Within ±20%: 33.33 points (Full match)
+• Within ±35%: 25 points (Strong match)
+• Within ±50%: 15 points (Partial match)
+• Outside ranges: 5 points
+• No data: 0 points
+
+Industry Match (worth 33.33 points):
+• Direct match: 33.33 points
+• Closely related: 25 points
+• Partial overlap: 15 points
+• Minor overlap: 5 points
+• No match: 0 points
+
+Geography Match (worth 33.33 points):
+• Direct match: 33.33 points
+• Major overlap: 25 points
+• Partial overlap: 15 points
+• Minor overlap: 5 points
+• No match: 0 points
+
+IMPORTANT:
+- Total score MUST be between 0 and 100
+- Calculate percentage differences for financials
+- Strong matches should result in high scores (80+)
+- Moderate matches should be around 60-79
+- Weak matches should be below 60
+
+DOCUMENT TO ANALYZE:
+{document_text}
+
+Return ONLY valid JSON with scores normalized to 100-point scale.
 """
-    
-    # Get response from Llama
-    response = llm(
-        prompt,
-        max_tokens=1024,
-        temperature=0.1,
-        top_p=0.95,
-        stop=["</s>", "\n\n\n"]
-    )
-    
-    return response['choices'][0]['text']
 
-# Modify your homepage section to include the Llama-based matching system
-if st.session_state.current_page == 'home':
-    st.header("Business Matching Assistant")
-    
-    # Initialize Llama
-    llm = initialize_llama()
-    if not llm:
-        st.error("Failed to initialize Llama model. Please check your model configuration.")
-    else:
-        # Create input form for business parameters
-        with st.form("business_parameters"):
-            st.subheader("Enter Business Parameters")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                industry = st.selectbox("Industry", [
-                    "Manufacturing", "Technology", "Healthcare", "Retail", 
-                    "Services", "Construction", "Other"
-                ])
-                revenue = st.number_input("Annual Revenue ($M)", min_value=0.0)
-                ebitda = st.number_input("EBITDA ($M)", min_value=0.0)
-            
-            with col2:
-                employees = st.number_input("Number of Employees", min_value=0)
-                location = st.text_input("Location")
-                growth_rate = st.slider("Growth Rate (%)", -20, 100, 0)
-            
-            additional_notes = st.text_area("Additional Notes", height=100)
-            
-            submitted = st.form_submit_button("Find Matches")
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a deal screening analyst. Score matches fairly based on actual alignment with criteria. Strong matches should receive high scores."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=512,
+            temperature=0
+        )
         
-        if submitted:
-            # Create parameters dictionary
-            parameters = {
-                "industry": industry,
-                "revenue_millions": revenue,
-                "ebitda_millions": ebitda,
-                "employees": employees,
-                "location": location,
-                "growth_rate_percentage": growth_rate,
-                "additional_notes": additional_notes
-            }
+        if not response or "choices" not in response or not response["choices"]:
+            return """Match Score: 0/100
+Key Points: LLM processing error
+Concerns: Failed to get response
+Summary: Unable to complete analysis"""
+
+        content = response["choices"][0]["message"]["content"].strip()
+        
+        # Clean and parse JSON
+        content = content.replace('```json', '').replace('```', '').strip()
+        start_idx = content.find('{')
+        end_idx = content.rfind('}')
+        
+        if start_idx == -1 or end_idx == -1:
+            return """Match Score: 0/100
+Key Points: Invalid format
+Concerns: No JSON found
+Summary: Failed to parse response"""
             
-            # Get list of one-pagers from storage
-            bucket_name = get_bucket_name()
-            files = list_bucket_files(bucket_name) if bucket_name else []
+        json_str = content[start_idx:end_idx + 1]
+        analysis = json.loads(json_str)
+        
+        # Ensure score is between 0-100
+        raw_score = int(analysis.get('score', 0))
+        adjusted_score = max(0, min(100, raw_score))  # Clamp between 0-100
+        
+        matching_points = analysis.get('matching_points', [])
+        concerns = analysis.get('concerns', [])
+        summary = analysis.get('summary', 'No summary provided')
+        
+        if isinstance(matching_points, str):
+            matching_points = [matching_points]
+        if isinstance(concerns, str):
+            concerns = [concerns]
+        
+        # Clean up formatting
+        matching_points = [point.replace('+', ' plus ').replace('-', ' - ').replace('  ', ' ') for point in matching_points]
+        concerns = [concern.replace('+', ' plus ').replace('-', ' - ').replace('  ', ' ') for concern in concerns]
             
-            if files:
-                with st.spinner("Analyzing matches..."):
-                    # Create a placeholder for the one-pagers data
-                    # You'll need to implement PDF text extraction and parsing
-                    one_pagers = []
+        return f"""Match Score: {adjusted_score}/100
+
+Key Matches:
+{chr(10).join('• ' + point for point in matching_points) if matching_points else '• None identified'}
+
+Concerns:
+{chr(10).join('• ' + concern for concern in concerns) if concerns else '• None identified'}
+
+Summary:
+{summary}"""
+            
+    except Exception as e:
+        print(f"Analysis error: {str(e)}")
+        return """Match Score: 0/100
+Key Points: Error occurred
+Concerns: Analysis failed
+Summary: Unable to process document"""
+
+def match_business_parameters(llm: Llama, parameters: Dict, bucket_name: str) -> Dict:
+    results = {}
+    error_log = []
+    
+    parsed_files = get_parsed_documents(bucket_name)
+    if not parsed_files:
+        return {}
+        
+    with st.spinner("Analyzing documents..."):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        documents_processed = st.empty()
+        avg_score = st.empty()
+        scores = []
+        
+        for idx, parsed_file in enumerate(parsed_files):
+            try:
+                status_text.text(f"Analyzing {parsed_file}...")
+                document_text = get_parsed_document(bucket_name, parsed_file)
+                
+                if document_text:
+                    display_name = os.path.basename(parsed_file).replace('.txt', '.pdf')
                     
-                    for file in files:
-                        # Download and process each one-pager
-                        content = download_blob(bucket_name, file)
-                        if content:
-                            # Parse PDF content (you'll need to implement this)
-                            parsed_content = {
-                                "file_name": file,
-                                "industry": "Sample Industry",
-                                "revenue": "Sample Revenue",
-                                "ebitda": "Sample EBITDA",
-                                # Add more fields as needed
-                            }
-                            one_pagers.append(parsed_content)
+                    print(f"\n=== Processing document: {display_name} ===")
+                    result = analyze_document(llm, document_text, parameters)
+                    results[display_name] = result
                     
-                    # Get matches using Llama
-                    matches = match_business_parameters(llm, parameters, one_pagers)
+                    # Extract score
+                    try:
+                        score_line = result.split('\n')[0]
+                        score = int(score_line.split(':')[1].strip().replace('/100', ''))
+                        scores.append(score)
+                    except (ValueError, IndexError) as e:
+                        error_log.append(f"Score extraction failed for {display_name}: {str(e)}")
                     
-                    # Display results in a nice format
-                    st.success("Analysis complete!")
-                    
-                    # Create tabs for different views
-                    tab1, tab2 = st.tabs(["Matches", "Raw Analysis"])
-                    
-                    with tab1:
-                        st.markdown("### Top Matches")
-                        st.markdown(matches)
+                    # Update progress
+                    progress = (idx + 1) / len(parsed_files)
+                    progress_bar.progress(progress)
+                    documents_processed.metric("Documents Processed", f"{idx + 1}/{len(parsed_files)}")
+                    if scores:
+                        avg_score.metric("Average Match Score", f"{sum(scores)/len(scores):.1f}%")
+                
+            except Exception as e:
+                display_name = os.path.basename(parsed_file).replace('.txt', '.pdf')
+                error_msg = f"Error analyzing {display_name}: {str(e)}"
+                error_log.append(error_msg)
+                results[display_name] = error_msg
+                
+        progress_bar.empty()
+        status_text.empty()
+        
+        # Display error log if there were any errors
+        if error_log:
+            print("\n=== Error Log ===")
+            for error in error_log:
+                print(error)
+            print("================\n")
+    
+    return results
+
+def get_parsed_document(bucket_name: str, parsed_file: str) -> str:
+    """
+    Retrieve pre-parsed document text content from storage.
+    Returns the actual text content of a single document.
+    """
+    try:
+        storage_client = get_storage_client()
+        bucket = storage_client.bucket(bucket_name)
+        # Use the parsed file path directly
+        blob = bucket.blob(parsed_file)
+        return blob.download_as_text()
+    except Exception as e:
+        st.error(f"Error retrieving parsed text for {parsed_file}: {str(e)}")
+        return None
+
+if st.session_state.current_page == 'home':
+    st.title("Private Equity Deal Matching Assistant")
+    
+    st.markdown("""
+    ### Deal Screening Tool
+    This tool matches potential investment opportunities against your deal criteria by analyzing our database of company profiles and deal memos.
+    
+    #### Key Criteria Analyzed:
+    - Company financials and metrics
+    - Industry and sector focus
+    - Geographic preferences
+    - Deal size and structure
+    - Growth potential and market position
+    """)
+    
+    st.divider()
+    
+    with st.form("deal_criteria"):
+        # Deal Size & Company Metrics Section
+        st.subheader("1. Deal Size & Company Metrics")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            enterprise_value = st.number_input(
+                "Enterprise Value Range ($M)",
+                min_value=0.0,
+                help="Target enterprise value in millions of dollars"
+            )
+            
+            revenue = st.number_input(
+                "Annual Revenue ($M)",
+                min_value=0.0,
+                help="Last twelve months (LTM) revenue in millions"
+            )
+        
+        with col2:
+            ebitda = st.number_input(
+                "EBITDA ($M)",
+                min_value=0.0,
+                help="Last twelve months (LTM) EBITDA in millions"
+            )
+            
+            ebitda_margin = st.slider(
+                "EBITDA Margin (%)",
+                min_value=0,
+                max_value=100,
+                value=15,
+                help="EBITDA as a percentage of revenue"
+            )
+
+        # Industry & Geography Section
+        st.subheader("2. Industry & Market Focus")
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            industry = st.selectbox(
+                "Target Industry",
+                [
+                    "Select primary industry...",
+                    "Technology & Software",
+                    "Healthcare & Life Sciences",
+                    "Industrial & Manufacturing",
+                    "Consumer & Retail",
+                    "Business Services",
+                    "Financial Services",
+                    "Energy & Resources",
+                    "Media & Telecommunications",
+                    "Other"
+                ],
+                help="Select the primary industry focus"
+            )
+            
+            sub_industry = st.text_input(
+                "Sub-Industry/Sector",
+                placeholder="e.g., SaaS, Healthcare Services, etc.",
+                help="Specific sector or sub-industry focus"
+            )
+        
+        with col4:
+            geography = st.selectbox(
+                "Geographic Focus",
+                [
+                    "Select region...",
+                    "North America",
+                    "Europe",
+                    "Asia Pacific",
+                    "Latin America",
+                    "Global"
+                ],
+                help="Primary geographic focus"
+            )
+            
+            specific_region = st.text_input(
+                "Specific Region/Market",
+                placeholder="e.g., Northeast US, Western Europe, etc.",
+                help="Target specific regions or markets"
+            )
+
+        # Growth & Operations Section
+        st.subheader("3. Growth & Operational Metrics")
+        col5, col6 = st.columns(2)
+        
+        with col5:
+            revenue_growth = st.slider(
+                "Revenue Growth Rate (%)",
+                min_value=-20,
+                max_value=200,
+                value=10,
+                help="Historical annual revenue growth rate"
+            )
+            
+            employee_count = st.number_input(
+                "Employee Count",
+                min_value=0,
+                help="Current number of full-time employees"
+            )
+        
+        with col6:
+            gross_margin = st.slider(
+                "Gross Margin (%)",
+                min_value=0,
+                max_value=100,
+                value=40,
+                help="Gross profit as a percentage of revenue"
+            )
+            
+            recurring_revenue = st.slider(
+                "Recurring Revenue (%)",
+                min_value=0,
+                max_value=100,
+                value=0,
+                help="Percentage of revenue that is recurring"
+            )
+
+        # Additional Criteria Section
+        st.subheader("4. Additional Investment Criteria")
+        additional_notes = st.text_area(
+            "Additional Requirements",
+            placeholder="""Specify any additional criteria such as:
+- Minimum cash flow requirements
+- Customer concentration limits
+- Management team preferences
+- Preferred deal structure
+- Industry-specific metrics
+- Exit strategy considerations""",
+            height=100,
+            help="Include any specific requirements or preferences not covered above"
+        )
+        
+        # Submit section
+        st.divider()
+        col7, col8 = st.columns([3, 1])
+        with col8:
+            submitted = st.form_submit_button("🔍 Screen Opportunities", use_container_width=True)
+        with col7:
+            st.markdown("*Click to analyze and find matching opportunities in our database*")
+
+    if submitted:
+        proceed_with_analysis = True
+        
+        if industry == "Select primary industry..." or geography == "Select region...":
+            st.error("Please select both an industry and geographic region.")
+            proceed_with_analysis = False
+            
+        if proceed_with_analysis:
+            # Initialize Llama
+            llm = initialize_llama()
+            if not llm:
+                st.error("Failed to initialize Llama model. Please check your model configuration.")
+                proceed_with_analysis = False
+            
+            if proceed_with_analysis:
+                # Prepare parameters dictionary
+                parameters = {
+                    "enterprise_value": enterprise_value,
+                    "revenue": revenue,
+                    "ebitda": ebitda,
+                    "ebitda_margin": ebitda_margin,
+                    "industry": industry,
+                    "sub_industry": sub_industry,
+                    "geography": geography,
+                    "specific_region": specific_region,
+                    "revenue_growth": revenue_growth,
+                    "employee_count": employee_count,
+                    "gross_margin": gross_margin,
+                    "recurring_revenue": recurring_revenue,
+                    "additional_notes": additional_notes
+                }
+
+                bucket_name = get_bucket_name()
+                if not bucket_name:
+                    st.error("Unable to access document storage.")
+                    proceed_with_analysis = False
+                
+                if proceed_with_analysis:
+                    # Create tabs first so we can update them during analysis
+                    tab1, tab2 = st.tabs(["💼 Matches", "📊 Analysis Progress"])
                     
                     with tab2:
-                        st.markdown("### Raw Analysis")
-                        st.json(parameters)
-                        st.json(one_pagers)
-            else:
-                st.error("No one-pagers found in storage.")
+                        progress_container = st.container()
+                        status_text = st.empty()
+                        progress_bar = st.progress(0)
+                        metrics_col1, metrics_col2 = st.columns(2)
+                        documents_processed = metrics_col1.empty()
+                        avg_score = metrics_col2.empty()
 
-# Add CSS to improve the appearance
+                    try:
+                        # Use the match_business_parameters function to analyze documents
+                        results = match_business_parameters(llm, parameters, bucket_name)
+                        
+                        if not results:
+                            st.warning("No documents found in database. Please upload some documents first.")
+                        else:
+                            # Sort results by match score
+                            sorted_results = dict(sorted(
+                                results.items(),
+                                key=lambda x: float(x[1].split('/100')[0].split(':')[-1].strip() if '/100' in x[1] else 0),
+                                reverse=True
+                            ))
+
+                            # Extract scores for summary metrics
+                            scores = []
+                            for analysis in results.values():
+                                try:
+                                    score = int(analysis.split('/100')[0].split(':')[-1].strip())
+                                    scores.append(score)
+                                except:
+                                    pass
+
+                            # Display final results
+                            with tab1:
+                                st.success("Analysis complete!")
+                                
+                                # Display top matches
+                                st.markdown("### Top Matching Opportunities")
+                                for filename, analysis in sorted_results.items():
+                                    try:
+                                        score = float(analysis.split('/100')[0].split(':')[-1].strip())
+                                        score_color = (
+                                            "🟢" if score >= 80 else
+                                            "🟡" if score >= 60 else
+                                            "🔴"
+                                        )
+                                        with st.expander(f"{score_color} {filename} (Match: {score:.1f}%)"):
+                                            st.markdown(analysis)
+                                    except:
+                                        with st.expander(f"⚠️ {filename}"):
+                                            st.markdown(analysis)
+                                
+                                # Display analysis summary
+                                st.markdown("### Analysis Summary")
+                                col1, col2, col3 = st.columns(3)
+                                col1.metric("Documents Analyzed", len(results))
+                                if scores:
+                                    col2.metric("Average Match Score", f"{sum(scores)/len(scores):.1f}%")
+                                    col3.metric("Top Match Score", f"{max(scores):.1f}%")
+                                
+                                # Display search parameters
+                                with st.expander("🎯 Search Parameters"):
+                                    st.json(parameters)
+
+                    except Exception as e:
+                        st.error(f"Error during analysis: {str(e)}")
+
 st.markdown("""
 <style>
-.stForm {
-    background-color: #f8f9fa;
-    padding: 20px;
-    border-radius: 10px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-}
-.stTextInput>div>div>input {
-    background-color: white;
-}
-.stSelectbox>div>div>select {
-    background-color: white;
-}
-.stNumberInput>div>div>input {
-    background-color: white;
-}
+    /* Form background and text colors */
+    .stForm {
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        color: #0f1116;
+    }
+    
+    /* Input fields styling */
+    .stTextInput>div>div>input, 
+    .stSelectbox>div>div>select, 
+    .stNumberInput>div>div>input {
+        background-color: white;
+        color: #0f1116;
+    }
+    
+    /* Text area styling */
+    .stTextArea>div>div>textarea {
+        background-color: white;
+        color: #0f1116;
+    }
+    
+    /* Labels and headers */
+    .streamlit-expanderHeader {
+        background-color: #f0f2f6;
+        color: #0f1116;
+    }
+    
+    /* General text color */
+    .stMarkdown {
+        color: white;
+    }
+    
+    /* Help text styling */
+    .stMarkdown small {
+        color: #white;
+    }
+    
+    /* Slider text */
+    .stSlider {
+        color: #0f1116;
+    }
+    
+    /* Number input text */
+    .stNumberInput {
+        color: #0f1116;
+    }
+    
+    /* Selectbox text */
+    .stSelectbox {
+        color: black;
+    }
+    
+    /* Section headers */
+    .main .block-container {
+        color: #0f1116;
+    }
+    
+    /* Make dark theme text visible */
+    @media (prefers-color-scheme: dark) {
+        .stTextInput>div>div>input,
+        .stSelectbox>div>div>select,
+        .stNumberInput>div>div>input,
+        .stTextArea>div>div>textarea {
+            color: black;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)

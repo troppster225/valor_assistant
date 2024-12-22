@@ -2,3 +2,14 @@ ollama==0.1.8
 streamlit==1.39.0
 gcsfs==2024.6.1
 st-files-connection
+langchain-community==0.2.16
+langchain-text-splitter==0.2.4
+langchain-chroma==0.1.3
+langchain-huggingface==0.0.3
+langchain-groq==0.1.9
+unstructured==0.15.0
+ustructured[pdf]==0.15.0
+nltk==3.8.1
+sentence-transformers==3.3.1
+scipy>=1.11.0
+torch>=2.0.0
