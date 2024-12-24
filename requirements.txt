@@ -13,3 +13,4 @@ nltk==3.8.1
 sentence-transformers==3.3.1
 scipy>=1.11.0
 torch>=2.0.0
+numpy
